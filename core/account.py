@@ -150,24 +150,22 @@ class AccountManager:
 
     def handle_non_http_error(self, error_context: str = "", request_id: str = "", quota_type: Optional[str] = None) -> None:
         """
-        统一处理非HTTP错误（网络错误、解析错误等）- 按配额类型冷却
+        统一处理非HTTP错误（网络错误、解析错误等）- 只记录日志，不触发冷却
 
         Args:
             error_context: 错误上下文（如"JWT获取"、"聊天请求"）
             request_id: 请求ID（用于日志）
-            quota_type: 配额类型（"text", "images", "videos"），用于按类型冷却
+            quota_type: 配额类型（保留参数以保持接口兼容性）
+
+        注意：网络错误、超时等是临时问题，应该直接切换账户重试，不标记配额冷却
         """
         req_tag = f"[req_{request_id}] " if request_id else ""
 
-        # 如果没有指定配额类型，默认冷却对话配额（因为对话是基础）
-        if not quota_type or quota_type not in QUOTA_TYPES:
-            quota_type = "text"
-
-        self.quota_cooldowns[quota_type] = time.time()
-        cooldown_seconds = self._get_quota_cooldown_seconds(quota_type)
+        # 只记录日志，不触发冷却
+        # 网络错误是临时的，应该直接切换账户重试
         logger.warning(
             f"[ACCOUNT] [{self.config.account_id}] {req_tag}"
-            f"{error_context}失败，{QUOTA_TYPES[quota_type]}配额将休息{cooldown_seconds}秒后自动恢复"
+            f"{error_context}失败，将切换账户重试（不触发冷却）"
         )
 
     def _get_quota_cooldown_seconds(self, quota_type: Optional[str]) -> int:
@@ -186,7 +184,7 @@ class AccountManager:
 
     def handle_http_error(self, status_code: int, error_detail: str = "", request_id: str = "", quota_type: Optional[str] = None) -> None:
         """
-        统一处理HTTP错误 - 按配额类型冷却
+        统一处理HTTP错误 - 按错误类型分类处理
 
         Args:
             status_code: HTTP状态码
@@ -196,7 +194,9 @@ class AccountManager:
 
         处理逻辑：
             - 400: 参数错误，不计入失败（客户端问题）
-            - 所有其他错误: 按配额类型冷却（默认为对话配额）
+            - 401/403: 认证错误，冷却 text 配额（等效冷却整个账户）
+            - 429: 按配额类型冷却（配额耗尽）
+            - 502/503/504/其他: 只记录日志，不触发冷却（临时服务器错误，应直接切换账户重试）
         """
         req_tag = f"[req_{request_id}] " if request_id else ""
 
@@ -208,16 +208,38 @@ class AccountManager:
             )
             return
 
-        # 所有其他错误：按配额类型冷却（默认为对话配额）
-        if not quota_type or quota_type not in QUOTA_TYPES:
-            quota_type = "text"
+        # 401/403认证错误：冷却 text 配额（等效冷却整个账户，但可自动恢复）
+        if status_code in (401, 403):
+            self.quota_cooldowns["text"] = time.time()
+            cooldown_seconds = self.text_rate_limit_cooldown_seconds
+            error_type = HTTP_ERROR_NAMES.get(status_code, f"HTTP {status_code}")
+            logger.warning(
+                f"[ACCOUNT] [{self.config.account_id}] {req_tag}"
+                f"遇到{error_type}认证错误，账户将休息{cooldown_seconds}秒后自动恢复"
+                f"{': ' + error_detail[:100] if error_detail else ''}"
+            )
+            return
 
-        self.quota_cooldowns[quota_type] = time.time()
-        cooldown_seconds = self._get_quota_cooldown_seconds(quota_type)
+        # 429配额错误：按配额类型冷却
+        if status_code == 429:
+            if not quota_type or quota_type not in QUOTA_TYPES:
+                quota_type = "text"
+
+            self.quota_cooldowns[quota_type] = time.time()
+            cooldown_seconds = self._get_quota_cooldown_seconds(quota_type)
+            logger.warning(
+                f"[ACCOUNT] [{self.config.account_id}] {req_tag}"
+                f"遇到429配额错误，{QUOTA_TYPES[quota_type]}配额将休息{cooldown_seconds}秒后自动恢复"
+                f"{': ' + error_detail[:100] if error_detail else ''}"
+            )
+            return
+
+        # 502/503/504/其他错误：只记录日志，不触发冷却
+        # 这些是临时服务器错误，应该直接重试切换账户，不标记配额
         error_type = HTTP_ERROR_NAMES.get(status_code, f"HTTP {status_code}")
         logger.warning(
             f"[ACCOUNT] [{self.config.account_id}] {req_tag}"
-            f"遇到{error_type}错误，{QUOTA_TYPES[quota_type]}配额将休息{cooldown_seconds}秒后自动恢复"
+            f"遇到{error_type}错误，将切换账户重试（不触发冷却）"
             f"{': ' + error_detail[:100] if error_detail else ''}"
         )
 
