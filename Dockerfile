@@ -1,68 +1,69 @@
 # Stage 1: 构建前端
 FROM node:20-slim AS frontend-builder
 WORKDIR /app/frontend
-
-# 先复制 package 文件利用 Docker 缓存
-COPY frontend/package.json frontend/package-lock.json ./
-RUN npm install --silent
-
-# 复制前端源码并构建
+COPY frontend/package*.json ./
+RUN npm install
 COPY frontend/ ./
 RUN npm run build
 
-# Stage 2: 最终运行时镜像
+# Stage 2: 构建 Python 依赖
+FROM python:3.11-slim AS python-builder
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Stage 3: 最终运行环境
 FROM python:3.11-slim
 WORKDIR /app
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    TZ=Asia/Shanghai
+# 安装系统依赖：包含 chromium + xvfb + curl
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    chromium \
+    chromium-driver \
+    xvfb \
+    libnss3 \
+    libxss1 \
+    libasound2 \
+    libatk-bridge2.0-0 \
+    libgtk-3-0 \
+    libdrm2 \
+    libgbm1 \
+    libxshmfence1 \
+    libxcb-dri3-0 \
+    libxcomposite1 \
+    libxcursor1 \
+    libxi6 \
+    libxtst6 \
+    fonts-liberation \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
 
-# 安装 Python 依赖和浏览器依赖（合并为单一 RUN 指令以减少层数）
-COPY requirements.txt .
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-        gcc \
-        curl \
-        tzdata \
-        chromium chromium-driver \
-        dbus dbus-x11 \
-        xvfb xauth \
-        libglib2.0-0 libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 \
-        libcups2 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 \
-        libxfixes3 libxrandr2 libgbm1 libasound2 libpango-1.0-0 \
-        libcairo2 fonts-liberation fonts-noto-cjk && \
-    ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone && \
-    pip install --no-cache-dir -r requirements.txt && \
-    apt-get purge -y gcc && \
-    apt-get autoremove -y && \
-    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+# 拷贝 Python 依赖
+COPY --from=python-builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+COPY --from=python-builder /usr/local/bin /usr/local/bin
 
-# 复制后端代码
-COPY main.py .
-COPY core ./core
-COPY util ./util
-COPY scripts ./scripts
+# 拷贝后端代码
+COPY . .
 
-# 从 builder 阶段只复制构建好的静态文件
-COPY --from=frontend-builder /app/static ./static
+# 拷贝前端构建产物到 static（按你的项目结构）
+RUN rm -rf static/dist && mkdir -p static/dist
+COPY --from=frontend-builder /app/frontend/dist static/dist
 
-# 创建数据目录
-RUN mkdir -p ./data
+# ---- 关键：适配 Zeabur 的 PORT=8080 ----
+ENV HOST=0.0.0.0
+ENV PORT=8080
 
-# 复制启动脚本
-COPY entrypoint.sh .
-RUN chmod +x entrypoint.sh
+# （可选但常用）给自动化浏览器一个明确路径，避免“找不到浏览器可执行文件”
+ENV CHROME_PATH=/usr/bin/chromium
+ENV CHROMIUM_PATH=/usr/bin/chromium
+ENV BROWSER_PATH=/usr/bin/chromium
 
-# 声明数据卷
-VOLUME ["/app/data"]
+EXPOSE 8080
 
-# 声明端口
-EXPOSE 7860
+# 健康检查：使用 PORT 环境变量（Zeabur 会注入）
+HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
+  CMD-SHELL curl -fsS "http://127.0.0.1:${PORT:-8080}/admin/health" || exit 1
 
-# 健康检查
-HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
-    CMD curl -f http://localhost:7860/admin/health || exit 1
+RUN chmod +x /app/entrypoint.sh
 
-# 启动服务
-CMD ["./entrypoint.sh"]
+CMD ["/app/entrypoint.sh"]
