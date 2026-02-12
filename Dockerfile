@@ -1,64 +1,78 @@
-# Stage 1: Build frontend assets
+# syntax=docker/dockerfile:1
+
+############################
+# 1) Build frontend
+############################
 FROM node:20-alpine AS frontend-builder
-
 WORKDIR /app/frontend
+
 COPY frontend/package*.json ./
-RUN npm install
-COPY frontend/ .
-RUN npm run build
+RUN npm ci --omit=dev || npm install
 
-# Stage 2: Build backend and serve frontend
-FROM python:3.11-slim AS backend
+COPY frontend/ ./
+RUN npm run build \
+ && mkdir -p /output \
+ && if [ -d dist ]; then cp -r dist/* /output/; \
+    elif [ -d build ]; then cp -r build/* /output/; \
+    else echo "Frontend build output not found (dist/build)."; ls -la; exit 1; fi
 
+
+############################
+# 2) Runtime (backend + ui)
+############################
+FROM python:3.11-slim AS runtime
 WORKDIR /app
 
-# Install system dependencies for Chrome and Playwright
-RUN apt-get update && apt-get install -y \
-    curl \
-    xvfb \
-    libnss3 \
-    libatk-bridge2.0-0 \
-    libdrm2 \
-    libxkbcommon0 \
-    libgbm1 \
-    libasound2 \
-    libxrandr2 \
-    libxfixes3 \
-    libxcomposite1 \
-    libxdamage1 \
-    libxext6 \
-    libxshmfence1 \
-    libx11-xcb1 \
-    libxcb1 \
-    libglib2.0-0 \
-    libgtk-3-0 \
-    libcairo2 \
-    libpango-1.0-0 \
-    libpangocairo-1.0-0 \
-    && rm -rf /var/lib/apt/lists/*
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
-COPY requirements.txt .
+# ---- Install Chromium (more compatible) + common runtime libs ----
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+    ca-certificates curl \
+    chromium chromium-driver \
+    xvfb xauth \
+    fonts-liberation fonts-noto-cjk \
+    libasound2 libcups2 libdbus-1-3 libdrm2 libgbm1 libgtk-3-0 \
+    libnss3 libnspr4 \
+    libx11-xcb1 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
+    libxkbcommon0 libxshmfence1 \
+    libatk1.0-0 libatk-bridge2.0-0 \
+    libpangocairo-1.0-0 libpango-1.0-0 libcairo2 \
+    libxext6 libxrender1 libxss1 \
+    libu2f-udev \
+ && rm -rf /var/lib/apt/lists/* \
+ # ---- make common aliases so different libs can find the browser ----
+ && ln -sf /usr/bin/chromium /usr/bin/google-chrome \
+ && ln -sf /usr/bin/chromium /usr/bin/chromium-browser
+
+# Optional: expose browser path for libs that read env
+ENV CHROME_PATH=/usr/bin/chromium \
+    CHROME_BIN=/usr/bin/chromium \
+    BROWSER_PATH=/usr/bin/chromium \
+    PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
+
+# ---- Python deps ----
+COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy backend source
+# ---- App code ----
 COPY . .
 
-# Copy built frontend assets
-COPY --from=frontend-builder /app/static ./static
+# ---- Put frontend assets where backend is likely to serve ----
+RUN mkdir -p /app/frontend/dist
+COPY --from=frontend-builder /output /app/frontend/dist
+RUN rm -rf /app/static && ln -s /app/frontend/dist /app/static
 
-# Make entrypoint executable
-RUN chmod +x /app/entrypoint.sh
+# ---- Entrypoint ----
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
 
-# ✅ Zeabur 通常会注入 PORT；这里给一个默认值，方便本地/兼容
+# Zeabur usually routes to 8080; keep PORT overridable
 ENV PORT=8080
-ENV HOST=0.0.0.0
-
-# ✅ Zeabur 的公网暴露口通常是 8080（或你设置的 PORT）
 EXPOSE 8080
 
-# ✅ 健康检查一定要打到“实际监听的端口”
-# 用 shell 形式，才能展开 ${PORT}
-HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD curl -fsS "http://127.0.0.1:${PORT:-8080}/admin/health" || exit 1
 
-ENTRYPOINT ["/app/entrypoint.sh"]
+ENTRYPOINT ["/entrypoint.sh"]
