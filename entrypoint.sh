@@ -1,13 +1,11 @@
-#!/usr/bin/env bash
+#!/bin/sh
 set -e
 
-export PORT="${PORT:-8080}"
-export HOST="${HOST:-0.0.0.0}"
-export DISPLAY="${DISPLAY:-:99}"
+export DISPLAY=:99
 
-# 启动虚拟显示（给自动化浏览器用）
-Xvfb :99 -screen 0 1280x720x24 -ac +extension RANDR &
-sleep 1
+# 启动虚拟屏幕（无头浏览器需要）
+Xvfb :99 -screen 0 1280x720x24 -ac +extension GLX +render -noreset &
+sleep 0.5
 
-# ✅ 用 uvicorn 强制监听 Zeabur 的 PORT
-exec python -m uvicorn main:app --host "$HOST" --port "$PORT"
+# 启动后端（项目默认就是 python main.py）
+exec python main.py
