@@ -1,71 +1,90 @@
 # syntax=docker/dockerfile:1
 
 ############################
-# 1) Build frontend
+# 1) Frontend Builder
 ############################
 FROM node:20-slim AS frontend-builder
+
 WORKDIR /app/frontend
 
+# 先只拷贝依赖清单，提高缓存命中
 COPY frontend/package*.json ./
-RUN npm install
 
+# 有 lock 用 ci，没有就 install（更兼容）
+RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi
+
+# 再拷贝前端源码
 COPY frontend/ ./
-# 兼容：有的前端输出 build，有的输出 dist
-RUN npm run build && \
-    if [ -d dist ]; then echo "frontend: dist ok"; \
-    elif [ -d build ]; then mv build dist; echo "frontend: build -> dist"; \
-    else echo "frontend build output not found (dist/build)"; exit 1; fi
+
+# 构建前端
+RUN npm run build
+
+# 收集前端产物：你的项目日志显示输出到 ../static（也就是 /app/static）
+WORKDIR /app
+RUN set -eux; \
+    mkdir -p /out/static; \
+    if [ -d "/app/static" ]; then \
+      echo "✅ frontend output: /app/static"; \
+      cp -a /app/static/. /out/static/; \
+    elif [ -d "/app/frontend/dist" ]; then \
+      echo "✅ frontend output: /app/frontend/dist"; \
+      cp -a /app/frontend/dist/. /out/static/; \
+    elif [ -d "/app/frontend/build" ]; then \
+      echo "✅ frontend output: /app/frontend/build"; \
+      cp -a /app/frontend/build/. /out/static/; \
+    else \
+      echo "❌ frontend build output not found (static/dist/build)"; \
+      ls -la /app; ls -la /app/frontend; \
+      exit 1; \
+    fi
 
 
 ############################
 # 2) Runtime
 ############################
 FROM python:3.11-slim AS runtime
-WORKDIR /app
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PIP_NO_CACHE_DIR=1 \
+    PIP_NO_CACHE_DIR=1
+
+# 装 chromium + xvfb（无头/有头都兼容）
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+      ca-certificates curl bash procps \
+      xvfb \
+      chromium chromium-driver \
+      fonts-noto-cjk fonts-liberation \
+    ; \
+    rm -rf /var/lib/apt/lists/*; \
+    # 兼容不同库寻找浏览器的路径
+    ln -sf /usr/bin/chromium /usr/bin/google-chrome; \
+    ln -sf /usr/bin/chromium /usr/bin/chromium-browser
+
+# 给各种自动化库“指路”（多放几个更稳）
+ENV CHROME_BIN=/usr/bin/chromium \
+    CHROMIUM_PATH=/usr/bin/chromium \
+    BROWSER_EXECUTABLE_PATH=/usr/bin/chromium \
+    PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium \
     DISPLAY=:99
 
-# 关键：安装 Chromium + Xvfb + bash/procps（entrypoint 里用到 bash/pkill）
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    bash \
-    procps \
-    curl \
-    ca-certificates \
-    xvfb \
-    fonts-noto-cjk \
-    fonts-noto-color-emoji \
-    chromium \
- && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
 
-# 兼容各种“自动找浏览器路径”的代码：给常见名字做软链接
-RUN ln -sf /usr/bin/chromium /usr/bin/google-chrome || true && \
-    ln -sf /usr/bin/chromium /usr/bin/google-chrome-stable || true && \
-    ln -sf /usr/bin/chromium /usr/bin/chromium-browser || true
+# 先装 python 依赖
+COPY requirements.txt ./
+RUN pip install -r requirements.txt
 
-# 常见环境变量（有些库会读这些）
-ENV CHROME_BIN=/usr/bin/chromium \
-    CHROMIUM_BIN=/usr/bin/chromium \
-    BROWSER_BIN=/usr/bin/chromium \
-    BROWSER_PATH=/usr/bin/chromium \
-    PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium \
-    CHROME_FLAGS="--no-sandbox --disable-dev-shm-usage"
+# 再拷贝后端代码
+COPY . .
 
-COPY requirements.txt /app/requirements.txt
-RUN pip install -r /app/requirements.txt
+# 拷贝前端静态资源到后端 static（你的旧 Dockerfile 就是这个逻辑）
+RUN mkdir -p /app/static
+COPY --from=frontend-builder /out/static/ /app/static/
 
-COPY . /app
-COPY --from=frontend-builder /app/frontend/dist /app/frontend/dist
+# entrypoint
+COPY entrypoint.sh /entrypoint.sh
+RUN sed -i 's/\r$//' /entrypoint.sh && chmod +x /entrypoint.sh
 
-RUN chmod +x /app/entrypoint.sh
-
-# Zeabur 固定 8080，你的 entrypoint 会用 $PORT（没有就默认 8080）
 EXPOSE 8080
-
-HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
-  CMD curl -fsS http://127.0.0.1:${PORT:-8080}/admin/health || exit 1
-
-ENTRYPOINT ["/app/entrypoint.sh"]
+ENTRYPOINT ["/entrypoint.sh"]
